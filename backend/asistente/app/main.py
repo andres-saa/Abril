@@ -3,13 +3,13 @@ from __future__ import annotations
 # FastAPI: Chat único con Function Calling + Redis + Recurrentes + Pomodoro + Presets (Memoria)
 # - /task?task=...
 # - Salida siempre a MacroDroid (sin emojis/markdown)
-# - "Bonitos" via LLM (intermedios/finales/confirmación). Recurrencia y Pomodoro incluidos.
+# - "Bonitos" via LLM (intermedios/ejecución/confirmación). Recurrencia y Pomodoro incluidos.
 # - Recurrentes:
 #     * Modo intervalo: cada N minutos/horas/días; optional "hasta <YYYY-MM-DD HH:MM>"
 #     * Modo diario fijo: todos los días a HH:MM
 # - Pomodoro: fases trabajo/descanso corto/largo, pausables/cancelables
 # - Presets: guardar/activar/listar/borrar (pomodoro, recurrentes y one-shot)
-# - Confirmación al vencer: preguntar si ya lo hiciste, pedir duración; insistir con frecuencia creciente
+# - Confirmación al vencer: preguntar si ya lo hiciste, pedir duración; insistir con frecuencia creciente (dinámica)
 # - "pendientes": lista numerada simple, sin IDs
 # - Zona horaria: America/Bogota
 # - MacroDroid: se envía chat_entry, require_response=true/false, require_sound=true/false
@@ -61,11 +61,12 @@ PRESET_KIND_POMODORO     = "pomodoro"
 PRESET_KIND_RECURRING    = "recurring"
 PRESET_KIND_ONESHOT      = "oneshot"
 
-# Mínimo 5 minutos entre avisos
-MIN_INTERVAL_SEC = 5 * 60
+# ===== Ajustes solicitados =====
+# Mínimo entre avisos (más corto para casos de 5min)
+MIN_INTERVAL_SEC = 60  # antes 5*60
 
-# Escalada de insistencia tras el vencimiento (minutos)
-NAG_SCHEDULE_MIN = [15, 10, 5, 3, 2, 1]  # luego queda 1 min constante
+# Escalada base (se recalcula dinámicamente según la "ventana" del recordatorio)
+BASE_NAG_SCHEDULE_MIN = [15, 10, 5, 3, 2, 1]  # fallback
 
 # -------- Utilidades --------
 def now_ts() -> float:
@@ -73,6 +74,13 @@ def now_ts() -> float:
 
 def ts_str_col(ts: float) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+# Formato conciso para UI: sin año ni segundos
+def ts_str_ui(ts: float) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%m-%d %H:%M")
+
+def hhmm(ts: float) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%H:%M")
 
 def parse_iso_local(iso_: str) -> Optional[float]:
     try:
@@ -104,9 +112,9 @@ def history_for_openai(n: int = 20) -> List[Dict]:
     return out
 
 def sanitize_for_tts(text: str) -> str:
-    text = re.sub(r"[\u2600-\u27BF\uE000-\uF8FF\U0001F000-\U0001FAFF]+", "", text)  # emojis/símbolos
-    text = re.sub(r"[\\*`_~•●■▪▫►✔✅➜➤➔➖➕]+", "", text)                           # decoradores
-    text = re.sub(r"^[\-\+\>]\s*", "", text, flags=re.MULTILINE)                    # bullets ascii
+    text = re.sub(r"[\u2600-\u27BF\uE000-\uF8FF\U0001F000-\U0001FAFF]+", "", text)
+    text = re.sub(r"[\\*`_~•●■▪▫►✔✅➜➤➔➖➕]+", "", text)
+    text = re.sub(r"^[\-\+\>]\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -232,7 +240,7 @@ def llm_rewrite(kind: str, base_text: str, mins_left: Optional[int] = None, phas
     if kind == "intermediate":
         return f"Hola senor Andres, en {mins_left} minutos por favor recuerde: {base_text}."
     if kind == "final":
-        return f"Hola senor Andres, no olvide por favor que debe {base_text}. Es importante para mantener una buena disciplina."
+        return f"Hola senor Andres, no olvide por favor que debe {base_text}."
     if kind == "recurring":
         return f"Hola senor Andres, por favor recuerde: {base_text}."
     if kind in ("confirm","confirm_nag"):
@@ -244,18 +252,70 @@ def llm_rewrite(kind: str, base_text: str, mins_left: Optional[int] = None, phas
         return "Hola senor Andres, tome un descanso corto para respirar y estirar."
     return "Hola senor Andres, tome un descanso largo para recuperar energía."
 
+# -------- Escalado dinámico de insistencia --------
+def dynamic_nag_schedule_minutes(window_sec: int) -> List[int]:
+    """
+    Devuelve lista de minutos para insistencia post-vencimiento:
+    - ventana <= 10 min: [2, 2, 1, 1, 1]
+    - ventana <= 30 min: [5, 5, 3, 2, 1]
+    - ventana <= 120 min: [15, 10, 5, 3, 2, 1]
+    - > 120 min: [30, 15, 10, 5, 3, 2, 1]
+    """
+    if window_sec <= 10*60:
+        return [2, 2, 1, 1, 1]
+    if window_sec <= 30*60:
+        return [5, 5, 3, 2, 1]
+    if window_sec <= 120*60:
+        return [15, 10, 5, 3, 2, 1]
+    return [30, 15, 10, 5, 3, 2, 1]
+
+def schedule_next_nag(nag_level: int, window_sec: int) -> float:
+    sched = dynamic_nag_schedule_minutes(window_sec)
+    minutes = sched[min(nag_level, len(sched)-1)]
+    return max(30, minutes * 60)
+
+# -------- Planificador de pings --------
+def schedule_first_ping(due_at: float, created_at: float) -> float:
+    now = now_ts()
+    remaining = max(0, due_at - now)
+    window_sec = max(60, int(due_at - created_at))  # contexto para dinámica
+    # Primera notificación hacia la mitad, con mínimo dinámico pequeño
+    half = remaining / 2.0
+    min_first = 60  # 1 minuto mínimo
+    # Si la ventana es muy corta (<= 5 min), avisar rápido (a ~1-2 min)
+    if window_sec <= 5*60:
+        return now + max(60, min(120, half))
+    # Si es media (<= 30 min), permitir min 2-3 min
+    if window_sec <= 30*60:
+        return now + max(120, half)
+    # Ventanas largas: usar MIN_INTERVAL_SEC como piso
+    return now + max(MIN_INTERVAL_SEC, half)
+
+def schedule_next_ping(due_at: float) -> Optional[float]:
+    now = now_ts()
+    remaining = due_at - now
+    if remaining <= MIN_INTERVAL_SEC:
+        return None
+    half = remaining / 2.0
+    next_at = now + max(60, half)  # siguiente a mitad de lo que queda, min 1 min
+    if next_at >= due_at:
+        return None
+    return next_at
+
 # -------- One-shot (mitades y confirmación final) --------
-def reminder_doc(rid: str, text: str, due_at: float, next_ping_at: float, status: str = "pending", created_at: Optional[float] = None, nag_level: int = 0) -> Dict:
+def reminder_doc(rid: str, text: str, due_at: float, next_ping_at: float, status: str = "pending", created_at: Optional[float] = None, nag_level: int = 0, window_sec: Optional[int] = None) -> Dict:
+    created_ts = created_at if created_at else now_ts()
     return {
         "id": rid,
         "text": text,
         "status": status,  # pending | await_confirm | done | cancelled
-        "created_at": str(created_at if created_at else now_ts()),
+        "created_at": str(created_ts),
         "done_at": "",            # ts cuando se marcó done
         "cancelled_at": "",       # ts cuando se canceló
         "due_at": str(due_at),
         "next_ping_at": str(next_ping_at),  # próximo aviso intermedio o próxima insistencia
         "nag_level": str(nag_level),        # sólo en await_confirm
+        "window_sec": str(int(window_sec if window_sec is not None else max(60, int(due_at - created_ts)))),
     }
 
 def schedule_from_natural(text: str) -> Optional[int]:
@@ -330,7 +390,6 @@ def infer_history_intent(user_text: str) -> Optional[str]:
         return "cancelled"
     if _HISTORY_RX_ALL.search(txt):
         return "all"
-    # variantes genéricas
     if re.search(r"\b(pasados|anteriores|hist[oó]ricos|historia)\b", txt, re.I):
         return "all"
     return None
@@ -340,8 +399,9 @@ SYSTEM_PROMPT = (
     "No uses emojis, asteriscos, guiones ni decoraciones. Zona horaria: America/Bogota. "
     "Cuando el usuario diga 'ya hice X', marca ese recordatorio como hecho (usa mark_done_by_text). "
     "Si pide 'pendientes', llama a list_pending_reminders y list_recurring, y responde con lista numerada simple: "
-    "'1. <texto> - para  MM-DD HH:MM  - falta <tiempo>' para one-shot, y "
-    "'recurrente: <texto> - siguiente  MM-DD HH:MM  - cada <X> - hasta <fecha>' para recurrentes. "
+    "'1. <texto>, creado HH:MM, suena MM-DD HH:MM, falta <tiempo>' para one-shot, y "
+    "'recurrente: <texto>, siguiente MM-DD HH:MM, cada <X>, hasta <fecha>' para recurrentes. "
+    "No muestres año ni segundos. Separa con comas. "
     "Si pide reactivar, usa reactivate_reminder o reactivate_by_text. "
     "Para frases del estilo 'cada N minutos/horas/días' usa create_recurring; "
     "si incluye 'hasta <fecha>' mapea a until_iso. "
@@ -362,38 +422,12 @@ SYSTEM_PROMPT = (
 
 PENDING_RX = re.compile(r"\b(pendiente|pendientes|tareas pendientes|mis recordatorios)\b", re.I)
 
-# -------- Planificador de pings --------
-def schedule_first_ping(due_at: float) -> float:
-    now = now_ts()
-    remaining = max(0, due_at - now)
-    half = remaining / 2.0
-    if half >= MIN_INTERVAL_SEC:
-        return now + half
-    pre = due_at - MIN_INTERVAL_SEC
-    if pre > now:
-        return pre
-    return now + MIN_INTERVAL_SEC
-
-def schedule_next_ping(due_at: float) -> Optional[float]:
-    now = now_ts()
-    remaining = due_at - now
-    if remaining <= MIN_INTERVAL_SEC:
-        return None
-    half = remaining / 2.0
-    next_at = now + max(half, MIN_INTERVAL_SEC)
-    if next_at >= due_at:
-        return None
-    return next_at
-
-def schedule_next_nag(nag_level: int) -> float:
-    minutes = NAG_SCHEDULE_MIN[min(nag_level, len(NAG_SCHEDULE_MIN)-1)]
-    return max(60, minutes * 60)
-
 # -------- DB helpers: One-shot --------
 def create_reminder_db(text: str, due_ts: float) -> str:
     rid = str(r.incr(KEY_REM_SEQ))
-    first_ping = schedule_first_ping(due_ts)
-    doc = reminder_doc(rid, text, due_ts, first_ping, status="pending")
+    created = now_ts()
+    first_ping = schedule_first_ping(due_ts, created)
+    doc = reminder_doc(rid, text, due_ts, first_ping, status="pending", created_at=created)
     r.hset(KEY_REM_HASH(rid), mapping=doc)
     r.zadd(KEY_REM_Z, {rid: float(doc["next_ping_at"])})
     r.sadd(KEY_REM_PENDING, rid)
@@ -410,19 +444,24 @@ def list_pending_db() -> List[Dict]:
         out.append({
             "id": rid,
             "text": data.get("text"),
-            "due_at_col": ts_str_col(float(data.get("due_at", str(now_ts())))),
-            "next_ping_at_col": ts_str_col(float(data.get("next_ping_at", str(now_ts())))),
+            "created_col_ui": hhmm(float(data.get("created_at", str(now_ts())))),
+            "due_at_col_ui": ts_str_ui(float(data.get("due_at", str(now_ts())))),
+            "next_ping_at_col_ui": ts_str_ui(float(data.get("next_ping_at", str(now_ts())))),
             "status": data.get("status"),
             "type": "one_shot",
         })
     return out
 
+def _clean_all_alarm_indices(rid: str):
+    """Quita el id de todas las estructuras de programación para evitar alarmas colgantes."""
+    r.zrem(KEY_REM_Z, rid)
+    r.srem(KEY_REM_PENDING, rid)
+
 def cancel_reminder_db(rid: str) -> bool:
     h = KEY_REM_HASH(rid)
     if not r.exists(h): return False
     r.hset(h, mapping={"status": "cancelled", "cancelled_at": str(now_ts())})
-    r.srem(KEY_REM_PENDING, rid)
-    r.zrem(KEY_REM_Z, rid)
+    _clean_all_alarm_indices(rid)
     r.sadd(KEY_REM_ALL, rid)
     return True
 
@@ -430,8 +469,7 @@ def mark_done_db(rid: str) -> bool:
     h = KEY_REM_HASH(rid)
     if not r.exists(h): return False
     r.hset(h, mapping={"status": "done", "done_at": str(now_ts())})
-    r.srem(KEY_REM_PENDING, rid)
-    r.zrem(KEY_REM_Z, rid)
+    _clean_all_alarm_indices(rid)
     r.sadd(KEY_REM_ALL, rid)
     return True
 
@@ -456,9 +494,18 @@ def reactivate_by_id(rid: str, in_minutes: Optional[int] = None) -> bool:
     if not r.exists(h): return False
     data = r.hgetall(h)
     text = data.get("text", "")
-    due = now_ts() + (max(1, in_minutes) * 60 if in_minutes is not None else 10 * 60)
-    first = schedule_first_ping(due)
-    r.hset(h, mapping={"status": "pending", "due_at": str(due), "next_ping_at": str(first), "text": text, "nag_level": "0"})
+    created = now_ts()
+    due = created + (max(1, in_minutes) * 60 if in_minutes is not None else 10 * 60)
+    first = schedule_first_ping(due, created)
+    r.hset(h, mapping={
+        "status": "pending",
+        "due_at": str(due),
+        "next_ping_at": str(first),
+        "text": text,
+        "nag_level": "0",
+        "created_at": str(created),
+        "window_sec": str(int(max(60, due - created))),
+    })
     r.sadd(KEY_REM_PENDING, rid)
     r.zadd(KEY_REM_Z, {rid: first})
     r.sadd(KEY_REM_ALL, rid)
@@ -473,9 +520,10 @@ def reactivate_by_text(q: str, in_minutes: Optional[int] = None) -> Optional[str
 def snooze_db(rid: str, minutes: int) -> bool:
     h = KEY_REM_HASH(rid)
     if not r.exists(h): return False
+    created = float(r.hget(h, "created_at") or now_ts())
     due = now_ts() + max(1, minutes) * 60
-    next_ping = schedule_first_ping(due)
-    r.hset(h, mapping={"status": "pending", "due_at": str(due), "next_ping_at": str(next_ping), "nag_level": "0"})
+    next_ping = schedule_first_ping(due, created)
+    r.hset(h, mapping={"status": "pending", "due_at": str(due), "next_ping_at": str(next_ping), "nag_level": "0", "window_sec": str(int(max(60, due - created)))})
     r.sadd(KEY_REM_PENDING, rid)
     r.zadd(KEY_REM_Z, {rid: next_ping})
     r.sadd(KEY_REM_ALL, rid)
@@ -486,19 +534,20 @@ def edit_reminder_db(rid: str, new_text: Optional[str]=None, when_iso: Optional[
     if not r.exists(h): return False
     d = r.hgetall(h)
     text = new_text.strip() if (isinstance(new_text,str) and new_text.strip()) else d.get("text","")
+    created = float(d.get("created_at", str(now_ts())))
     if in_minutes is not None and int(in_minutes) >= 1:
         due = now_ts() + int(in_minutes) * 60
     elif when_iso:
         parsed = parse_iso_local(when_iso)
         due = parsed if parsed else now_ts() + 10*60
     else:
-        # solo cambia el texto
         r.hset(h, mapping={"text": text})
         r.sadd(KEY_REM_ALL, rid)
         return True
-    first = schedule_first_ping(due)
+    first = schedule_first_ping(due, created)
     r.hset(h, mapping={
-        "text": text, "status":"pending", "due_at": str(due), "next_ping_at": str(first), "nag_level":"0"
+        "text": text, "status":"pending", "due_at": str(due), "next_ping_at": str(first), "nag_level":"0",
+        "window_sec": str(int(max(60, due - created))),
     })
     r.sadd(KEY_REM_PENDING, rid)
     r.zadd(KEY_REM_Z, {rid: first})
@@ -539,7 +588,7 @@ def parse_recurring(text: str) -> Optional[Dict]:
                 until_ts = None
         return {"mode":"interval", "interval_sec": interval, "until_ts": until_ts}
 
-    # Modo diario fijo: “cada día a las 3 am”, “todos los días 03:00”
+    # Modo diario fijo
     m2 = re.search(r"(cada\s+d[ií]a|todos?\s+los\s+d[ií]as).*(\d{1,2})[:\.]?(\d{2})?\s*(am|pm)?", text, re.I)
     if m2:
         hh = int(m2.group(2))
@@ -569,7 +618,7 @@ def create_recurring_db(text: str, interval_sec: int, until_ts: Optional[float])
         "mode": "interval",
         "interval_sec": str(interval_sec),
         "until_ts": str(until_ts) if until_ts else "",
-        "hhmm": "",    # reservado para modo daily_time (HH:MM)
+        "hhmm": "",
         "next_at": str(due),
         "status": "active"
     }
@@ -614,9 +663,9 @@ def list_recurring_db() -> List[Dict]:
             cada = f"diariamente a las {d.get('hhmm','--:--')}"
         out.append({
             "id": rid, "text": d.get("text",""), "type": "recurring",
-            "next_at_col": ts_str_col(float(d.get("next_at", str(now_ts())))),
+            "next_at_col_ui": ts_str_ui(float(d.get("next_at", str(now_ts())))),
             "interval_human": cada,
-            "until_col": ts_str_col(float(until)) if until else "indefinido",
+            "until_col_ui": ts_str_ui(float(until)) if until else "indefinido",
             "status": "active",
             "mode": mode
         })
@@ -626,8 +675,8 @@ def cancel_recurring_db(rid: str) -> bool:
     h = KEY_REC_HASH(rid)
     if not r.exists(h): return False
     r.hset(h, mapping={"status":"cancelled"})
-    r.srem(KEY_REC_SET, rid)
     r.zrem(KEY_REC_Z, rid)
+    r.srem(KEY_REC_SET, rid)
     r.sadd(KEY_REC_ALL, rid)
     return True
 
@@ -682,7 +731,6 @@ def edit_recurring_db(
     update = {"text": text}
 
     if daily_time:
-        # Cambiamos a modo diario fijo HH:MM
         try:
             hh, mm = map(int, daily_time.split(":"))
             hh = max(0,min(23,hh)); mm = max(0,min(59,mm))
@@ -699,12 +747,10 @@ def edit_recurring_db(
         r.sadd(KEY_REC_ALL, rid)
         return True
 
-    # Si no hay daily_time, podemos seguir en modo intervalo (o convertir a intervalo)
     if interval_minutes is not None:
         interval_sec = max(MIN_INTERVAL_SEC, int(interval_minutes)*60)
         nxt = now_ts() + interval_sec
         update.update({"mode":"interval", "interval_sec": str(interval_sec), "next_at": str(nxt), "status":"active"})
-    # until opcional
     if until_iso:
         uts = parse_iso_local(until_iso)
         update.update({"until_ts": str(uts) if uts else ""})
@@ -773,6 +819,8 @@ def _fmt_time_left(target_ts: float) -> str:
     hrs  = mins // 60
     if hrs >= 1:
         rem_m = mins % 60
+        if rem_m == 0:
+            return f"{hrs} horas"
         return f"{hrs} horas {rem_m} minutos"
     return f"{mins} minutos"
 
@@ -781,23 +829,28 @@ def format_pending_plain(items_oneshot: List[Dict], items_rec: List[Dict]) -> st
 
     for i, it in enumerate(items_oneshot, start=1):
         text = (it.get("text") or "").strip()
-        due_at = it.get("due_at_col")
+        created_ui = it.get("created_col_ui")
+        due_ui = it.get("due_at_col_ui")
         try:
-            dt = datetime.strptime(due_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+            # Para "falta ..."
+            dt = datetime.strptime(due_ui, "%m-%d %H:%M").replace(year=datetime.now(TZ).year, tzinfo=TZ)
             left = _fmt_time_left(dt.timestamp())
         except Exception:
             left = "desconocido"
         status = it.get("status","pending")
-        lines.append(f"{i}. {text} - para {due_at} - falta {left}" + ("" if status=="pending" else " - esperando confirmación"))
+        base = f"{i}. {text}, creado {created_ui}, suena {due_ui}, falta {left}"
+        if status != "pending":
+            base += ", esperando confirmación"
+        lines.append(base)
 
     base = len(lines)
     for j, it in enumerate(items_rec, start=1):
         text = (it.get("text") or "").strip()
-        next_at = it.get("next_at_col")
+        next_at = it.get("next_at_col_ui")
         cada = it.get("interval_human")
-        hasta = it.get("until_col")
+        hasta = it.get("until_col_ui")
         idx = base + j
-        lines.append(f"{idx}. recurrente: {text} - siguiente {next_at} - cada {cada} - hasta {hasta}")
+        lines.append(f"{idx}. recurrente: {text}, siguiente {next_at}, cada {cada}, hasta {hasta}")
 
     if not lines:
         return "no tienes recordatorios pendientes"
@@ -813,10 +866,10 @@ def list_all_oneshot_db() -> List[Dict]:
             "id": rid,
             "text": d.get("text",""),
             "status": d.get("status",""),
-            "created_at": ts_str_col(float(d.get("created_at", now_ts()))),
-            "due_at": ts_str_col(float(d.get("due_at", now_ts()))),
-            "done_at": ts_str_col(float(d.get("done_at"))) if d.get("done_at") else "",
-            "cancelled_at": ts_str_col(float(d.get("cancelled_at"))) if d.get("cancelled_at") else "",
+            "created_at_ui": hhmm(float(d.get("created_at", now_ts()))),
+            "due_at_ui": ts_str_ui(float(d.get("due_at", now_ts()))),
+            "done_at_ui": hhmm(float(d.get("done_at"))) if d.get("done_at") else "",
+            "cancelled_at_ui": hhmm(float(d.get("cancelled_at"))) if d.get("cancelled_at") else "",
         })
     return out
 
@@ -829,7 +882,7 @@ def list_done_today_db() -> List[Dict]:
         if not d or d.get("status") != "done" or not d.get("done_at"): continue
         ts = float(d["done_at"])
         if start <= ts <= end:
-            out.append({"id": rid, "text": d.get("text",""), "done_at": ts_str_col(ts)})
+            out.append({"id": rid, "text": d.get("text",""), "done_at_ui": hhmm(ts)})
     return out
 
 def list_cancelled_db() -> List[Dict]:
@@ -838,7 +891,7 @@ def list_cancelled_db() -> List[Dict]:
     for rid in ids:
         d = r.hgetall(KEY_REM_HASH(rid))
         if not d or d.get("status") != "cancelled": continue
-        out.append({"id": rid, "text": d.get("text",""), "cancelled_at": ts_str_col(float(d.get("cancelled_at", now_ts())))})
+        out.append({"id": rid, "text": d.get("text",""), "cancelled_at_ui": hhmm(float(d.get("cancelled_at", now_ts())))})
     return out
 
 def format_all_plain(oneshot: List[Dict]) -> str:
@@ -846,20 +899,20 @@ def format_all_plain(oneshot: List[Dict]) -> str:
         return "no hay historial de recordatorios"
     lines = []
     for i, it in enumerate(oneshot, start=1):
-        base = f"{i}. {it['text']} - creado {it['created_at']} - vence {it['due_at']} - estado {it['status']}"
-        if it.get("done_at"): base += f" - hecho {it['done_at']}"
-        if it.get("cancelled_at"): base += f" - cancelado {it['cancelled_at']}"
+        base = f"{i}. {it['text']}, creado {it['created_at_ui']}, vence {it['due_at_ui']}, estado {it['status']}"
+        if it.get("done_at_ui"): base += f", hecho {it['done_at_ui']}"
+        if it.get("cancelled_at_ui"): base += f", cancelado {it['cancelled_at_ui']}"
         lines.append(base)
     return "\n".join(lines)
 
 def format_done_today_plain(items: List[Dict]) -> str:
     if not items: return "hoy no has completado recordatorios"
-    lines = [f"{i}. {it['text']} - hecho {it['done_at']}" for i,it in enumerate(items, start=1)]
+    lines = [f"{i}. {it['text']}, hecho {it['done_at_ui']}" for i,it in enumerate(items, start=1)]
     return "\n".join(lines)
 
 def format_cancelled_plain(items: List[Dict]) -> str:
     if not items: return "no tienes recordatorios cancelados"
-    lines = [f"{i}. {it['text']} - cancelado {it['cancelled_at']}" for i,it in enumerate(items, start=1)]
+    lines = [f"{i}. {it['text']}, cancelado {it['cancelled_at_ui']}" for i,it in enumerate(items, start=1)]
     return "\n".join(lines)
 
 # -------- PRESETS (implementación completa) --------
@@ -871,12 +924,11 @@ def list_presets_db() -> List[Dict]:
     out: List[Dict] = []
     for nm in names:
         hkey = KEY_PRESET_HASH(nm)
-        if not r.exists(hkey): 
+        if not r.exists(hkey):
             r.srem(KEY_PRESET_SET, nm)
             continue
         d = r.hgetall(hkey)
         kind = d.get("kind")
-        # devolvemos un resumen simple y datos clave para arrancar
         if kind == PRESET_KIND_POMODORO:
             out.append({
                 "name": nm, "kind": kind,
@@ -893,10 +945,10 @@ def list_presets_db() -> List[Dict]:
                 "text": d.get("text",""),
                 "interval_minutes": int(d.get("interval_minutes","10")),
                 "until_iso": d.get("until_iso",""),
-                "mode": d.get("mode","interval"),   # interval | daily_time
+                "mode": d.get("mode","interval"),
                 "hhmm": d.get("hhmm",""),
             })
-        else:  # one-shot
+        else:
             out.append({
                 "name": nm, "kind": kind,
                 "text": d.get("text",""),
@@ -911,7 +963,6 @@ def delete_preset_db(name: str) -> bool:
     r.srem(KEY_PRESET_SET, nm)
     return existed
 
-# -- guardar presets --
 def save_pomodoro_preset(name: str, text: str, work_min: int, short_break_min: int, long_break_min: int, cycles_total: int, long_every: int) -> bool:
     nm = _norm_preset_name(name)
     payload = {
@@ -957,7 +1008,6 @@ def save_oneshot_preset(name: str, text: str, in_minutes: int) -> bool:
     r.sadd(KEY_PRESET_SET, nm)
     return True
 
-# -- activar presets --
 def start_pomodoro_preset(name: str) -> Optional[str]:
     nm = _norm_preset_name(name)
     d = r.hgetall(KEY_PRESET_HASH(nm))
@@ -980,7 +1030,6 @@ def start_recurring_preset(name: str) -> Optional[str]:
     if mode == "daily_time" and d.get("hhmm"):
         hh, mm = map(int, d["hhmm"].split(":"))
         return create_recurring_daily_time_db(text, hh, mm)
-    # interval
     interval_minutes = int(d.get("interval_minutes","10"))
     until_ts = parse_iso_local(d.get("until_iso","")) if d.get("until_iso") else None
     return create_recurring_db(text, max(5, interval_minutes)*60, until_ts)
@@ -1353,7 +1402,7 @@ TOOLS = [
 def reminder_worker():
     """
     Bucle cada 15s:
-      (A) One-shot: avisos intermedios y confirmación + insistencia escalonada
+      (A) One-shot: avisos intermedios y confirmación + insistencia escalonada dinámica
       (B) Recurrencia: dispara en next_at, reprograma según modo (intervalo o diario fijo)
       (C) Pomodoro: fases y reprogramación por fase
     """
@@ -1372,6 +1421,8 @@ def reminder_worker():
                 status = data.get("status","pending")
                 text = data.get("text","").strip()
                 due_at = float(data.get("due_at"))
+                created_at = float(data.get("created_at", str(now)))
+                window_sec = int(float(data.get("window_sec", str(max(60, due_at - created_at)))))
 
                 if status == "pending":
                     if now >= due_at:
@@ -1384,7 +1435,7 @@ def reminder_worker():
                             r.zadd(KEY_REM_Z, {rid: retry_at})
                             continue
 
-                        next_nag = now + schedule_next_nag(0)
+                        next_nag = now + schedule_next_nag(0, window_sec)
                         r.hset(h, mapping={"status": "await_confirm", "nag_level": "0", "next_ping_at": str(next_nag)})
                         r.zadd(KEY_REM_Z, {rid: next_nag})
                         continue
@@ -1417,7 +1468,7 @@ def reminder_worker():
                         r.zadd(KEY_REM_Z, {rid: retry_at})
                         continue
 
-                    next_gap = schedule_next_nag(nag_level + 1)
+                    next_gap = schedule_next_nag(nag_level + 1, window_sec)
                     r.hset(h, mapping={"nag_level": str(nag_level + 1), "next_ping_at": str(now + next_gap)})
                     r.zadd(KEY_REM_Z, {rid: now + next_gap})
 
@@ -1457,8 +1508,8 @@ def reminder_worker():
                             r.hset(h, mapping={"next_at": str(nxt)})
                             r.zadd(KEY_REC_Z, {rid: nxt})
                     else:
-                        hh, mm = map(int, (d.get("hhmm","00:00").split(":")))
-                        nxt = next_daily_time_epoch(hh, mm)
+                        hh_v, mm_v = map(int, (d.get("hhmm","00:00").split(":")))
+                        nxt = next_daily_time_epoch(hh_v, mm_v)
                         r.hset(h, mapping={"next_at": str(nxt)})
                         r.zadd(KEY_REC_Z, {rid: nxt})
 
@@ -1502,24 +1553,29 @@ def reminder_worker():
 
 # -------- OpenAI orquestador --------
 def openai_chat_with_tools(user_text: str) -> str:
-    # Atajos de servidor: PENDIENTES
+    # Atajos: PENDIENTES
     if infer_is_pending_request(user_text):
         return format_pending_plain(list_pending_db(), list_recurring_db())
 
-    # One-shot implícito ("en X minutos/horas ...")
+    # One-shot implícito ("en X minutos/horas ...") — evitar duplicados
     sec = schedule_from_natural(user_text)
     if sec:
-        create_reminder_db(user_text.strip(), now_ts() + sec)
+        rid = create_reminder_db(user_text.strip(), now_ts() + sec)
+        d = r.hgetall(KEY_REM_HASH(rid))
+        created_ui = hhmm(float(d["created_at"]))
+        due_ui = ts_str_ui(float(d["due_at"]))
+        return f"listo, '{d['text']}', creado {created_ui}, suena {due_ui}"
 
-    # Recurrente implícito (intervalo o diario)
+    # Recurrente implícito — evitar duplicados
     rec = parse_recurring(user_text)
     if rec:
         if rec["mode"] == "interval":
-            create_recurring_db(user_text.strip(), rec["interval_sec"], rec["until_ts"])
+            rid = create_recurring_db(user_text.strip(), rec["interval_sec"], rec["until_ts"])
         else:
-            create_recurring_daily_time_db(user_text.strip(), rec["hh"], rec["mm"])
+            rid = create_recurring_daily_time_db(user_text.strip(), rec["hh"], rec["mm"])
+        return "listo"
 
-    # Atajos de servidor: HISTÓRICO (siempre desde Redis)
+    # Atajos: HISTÓRICO
     hist_intent = infer_history_intent(user_text)
     if hist_intent == "done_today":
         items = list_done_today_db()
@@ -1531,7 +1587,7 @@ def openai_chat_with_tools(user_text: str) -> str:
         items = list_all_oneshot_db()
         return format_all_plain(items)
 
-    # LLM + Tools (solo si no hubo atajo de servidor)
+    # LLM + Tools (si no hubo atajo)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history_for_openai(20)
     messages.append({"role": "user", "content": user_text})
 
@@ -1563,7 +1619,7 @@ def openai_chat_with_tools(user_text: str) -> str:
                 else:
                     due = now_ts() + 10 * 60
                 rid = create_reminder_db(text, due)
-                tool_output = {"ok": True, "id": rid, "due_at_col": ts_str_col(due)}
+                tool_output = {"ok": True, "id": rid, "due_at_ui": ts_str_ui(due)}
 
             elif name == "cancel_reminder":
                 rid = str(args.get("id")); tool_output = {"ok": cancel_reminder_db(rid)}
@@ -1617,8 +1673,8 @@ def openai_chat_with_tools(user_text: str) -> str:
 
             elif name == "create_recurring_daily_time":
                 text = (args.get("text") or "").strip()
-                hhmm = args.get("hhmm")
-                hh, mm = map(int, hhmm.split(":"))
+                hhmm_s = args.get("hhmm")
+                hh, mm = map(int, hhmm_s.split(":"))
                 rid = create_recurring_daily_time_db(text, hh, mm)
                 tool_output = {"ok": True, "id": rid}
 
@@ -1783,7 +1839,7 @@ def openai_chat_with_tools(user_text: str) -> str:
 # -------- FastAPI --------
 app = FastAPI(
     title="Chat con Function Calling y Redis (bonito + recurrentes + pomodoro + presets + require_response + confirmaciones + require_sound + histórico + edición)",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 _worker_started = False
@@ -1813,9 +1869,10 @@ def task(task: str = Query(..., description="Texto a reenviar (ej: ?task=hola)")
         * One-shot: crear/listar/posponer/reactivar/cancelar/marcar hecho/EDITAR.
         * Recurrentes: crear intervalo o diario fijo, listar, pausar/reanudar/cancelar/EDITAR (texto/intervalo/hasta/hora fija).
         * Pomodoro: crear/pausar/reanudar/cancelar.
-        * Presets: guardar/activar/listar/borrar.
-        * Histórico: ver todo, ver hechos hoy, ver cancelados.
-    - Confirmación al vencer: se pregunta si ya se hizo y se insiste con frecuencia creciente; ofrece aplazar o cancelar.
+    - Presets: guardar/activar/listar/borrar.
+    - Histórico: ver todo, ver hechos hoy, ver cancelados.
+    - Confirmación al vencer: dinámica según ventana; pregunta si ya se hizo y ofrece aplazar/cancelar.
+    - Listados: concisos, con comas, sin año ni segundos.
     """
     push_history("user", task)
     answer = openai_chat_with_tools(task)
